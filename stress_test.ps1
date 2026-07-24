@@ -1,7 +1,7 @@
 # AGRICEF - PLANO DE STRESS TEST COMPLETO
 # Cobertura: erro humano, falha de tempo, concorrencia, saldo, fallback
 
-$GAS = "https://script.google.com/macros/s/AKfycbybtpUgNv_P8YkRNLmPwQVB4n3cS4XMlQQVQUFOgV7MUbjJWK5Xt8HZ8IJEUVHMJCihgA/exec"
+$GAS = "https://script.google.com/macros/s/AKfycbzqXA7fg1-IEQbbp4Zggwy9FMzAXaUOfEbjpppZslJLu9f0TbiMelaOroHTe7qYencItw/exec"
 $KEY = "AGF2026"
 $PASS = 0; $FAIL = 0; $WARN = 0
 $ABERTOIDS_TESTE = @()

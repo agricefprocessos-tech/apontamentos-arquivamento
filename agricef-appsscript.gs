@@ -19,7 +19,14 @@
 //   O  OBSERVAÇÃO  ← usado para QTD PLANEJADA
 // ================================================================
 
-const SPREADSHEET_ID  = '15vtJ2eOw3Zd9f5MmwqEj18nsGAvVkFYFpsUsRbZM6Ik';
+const SPREADSHEET_ID  = '1KxK9Fk7fqkvEdo71n3hHZnYTaH1m63LEQSsD_YsL_co'; // COPIA DE TESTE - nao e producao
+
+// Rode esta funcao uma vez pelo editor (Executar > autorizarAcesso) para conceder
+// as permissoes do projeto novo. So precisa ser feito uma vez.
+function autorizarAcesso() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  Logger.log('Acesso OK: ' + ss.getName());
+}
 const ABA_RESPOSTAS   = 'Respostas do Formulário 1';
 const ABA_ABERTOS     = 'Abertos';
 const ABA_OPERADORES  = 'Cadastro_Operadores';

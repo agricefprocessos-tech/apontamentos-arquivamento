@@ -12,7 +12,7 @@
 // mesmo com o app fechado (Android/Chrome; no iOS não existe equivalente, ver index.html).
 // ============================================================================
 
-const API = 'https://script.google.com/macros/s/AKfycbybtpUgNv_P8YkRNLmPwQVB4n3cS4XMlQQVQUFOgV7MUbjJWK5Xt8HZ8IJEUVHMJCihgA/exec';
+const API = 'https://script.google.com/macros/s/AKfycbzqXA7fg1-IEQbbp4Zggwy9FMzAXaUOfEbjpppZslJLu9f0TbiMelaOroHTe7qYencItw/exec';
 const FILA_MAX_TENTATIVAS = 20; // mais tolerante — falhas intermitentes do Apps Script
 const TIPOS_FECHAMENTO_FILA = ['FECHAMENTO', 'TERMINO_RETRABALHO', 'TERMINO_PARADA'];
 const FILA_DB_NAME = 'AgricefOfflineDB';
