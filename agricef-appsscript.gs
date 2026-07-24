@@ -37,6 +37,8 @@ const ABA_ANALISES_IA = 'Analises_IA';
 const ABA_JUSTIFICATIVAS = 'Justificativas_Auditoria';
 const ABA_IDEMPOTENCY    = 'IdempotencyLog';
 const ABA_PARADAS_ANINHADAS = 'Paradas_Aninhadas';
+const ABA_HISTORICO = 'Historico'; // arquivamento — mesmo schema de ABA_RESPOSTAS
+const ARQUIVAMENTO_MARGEM_DIAS = 30; // não arquiva nada fechado há menos de N dias
 
 // ================================================================
 // SCHEMA DE COLUNAS (0-indexed)
@@ -387,6 +389,28 @@ function doGet(e) {
     try {
       const cutoff = e.parameter.cutoff || '2026-05-29';
       return jsonResponse(deletarAberturasOrfas(cutoff));
+    } catch(err) {
+      return jsonResponse({ success: false, message: err.message });
+    }
+  }
+  if (action === 'previewArquivamento' && _adminAutorizado(e.parameter.key)) {
+    try {
+      return jsonResponse(previewArquivamento(e.parameter.margemDias));
+    } catch(err) {
+      return jsonResponse({ success: false, message: err.message });
+    }
+  }
+  if (action === 'executarArquivamento' && _adminAutorizado(e.parameter.key)) {
+    try {
+      return jsonResponse(executarArquivamento(e.parameter.margemDias));
+    } catch(err) {
+      return jsonResponse({ success: false, message: err.message });
+    }
+  }
+  if (action === 'ativarTriggerArquivamento' && _adminAutorizado(e.parameter.key)) {
+    try {
+      criarTriggerArquivamento();
+      return jsonResponse({ success: true, message: 'Trigger de arquivamento criado: executarArquivamento diariamente às 3h.' });
     } catch(err) {
       return jsonResponse({ success: false, message: err.message });
     }
@@ -2455,6 +2479,250 @@ function normalizarCodigoOp(val) {
 // Colunas: 0:NrSerie 1:CodItem 2:Operacao 3:QtdRestante 4:UltimaAtualizacao
 // ================================================================
 
+// Arquivamento — aba com o MESMO schema de ABA_RESPOSTAS (cabeçalho copiado da aba viva,
+// não hardcoded, pra nunca dessincronizar se uma coluna nova for adicionada em Respostas).
+function garantirAbaHistorico(ss) {
+  let aba = ss.getSheetByName(ABA_HISTORICO);
+  if (!aba) {
+    aba = ss.insertSheet(ABA_HISTORICO);
+    const abaRe = ss.getSheetByName(ABA_RESPOSTAS);
+    const cabecalho = abaRe ? abaRe.getRange(1, 1, 1, abaRe.getLastColumn()).getValues()[0] : [];
+    if (cabecalho.length > 0) {
+      aba.getRange(1, 1, 1, cabecalho.length).setValues([cabecalho]);
+      aba.setFrozenRows(1);
+      aba.getRange(1, 1, 1, cabecalho.length).setFontWeight('bold').setBackground('#5a5a5a').setFontColor('#fff');
+    }
+  }
+  return aba;
+}
+
+// Leitura mesclada Historico + Respostas, no MESMO formato de abaRe.getDataRange().getValues()
+// (cabeçalho no índice 0, dados a partir do índice 1). Historico guarda dados mais antigos que
+// a aba viva — prepend antes de Respostas preserva a ordem cronológica que o replay de saldo e
+// as auditorias assumem. Usada só por caminhos frios (auditorias de histórico completo e
+// ferramentas administrativas que podem mirar num registro já arquivado) — o caminho quente de
+// escrita (gravarApontamento/recalcularSaldoParcial) nunca chama isto, ver Contexto do plano.
+function _lerRespostasComHistorico(ss) {
+  const abaRe = ss.getSheetByName(ABA_RESPOSTAS);
+  const dadosRe = abaRe ? abaRe.getDataRange().getValues() : [[]];
+  const abaHist = ss.getSheetByName(ABA_HISTORICO);
+  if (!abaHist || abaHist.getLastRow() < 2) return dadosRe;
+  const dadosHist = abaHist.getDataRange().getValues();
+  return [dadosRe[0] || dadosHist[0]].concat(dadosHist.slice(1)).concat(dadosRe.slice(1));
+}
+
+// ================================================================
+// ARQUIVAMENTO DE HISTÓRICO
+// ================================================================
+
+function _carimboArquivamentoMs(raw) {
+  const ms = parseCarimboGsMs(formatarCarimboGs(raw));
+  return isNaN(ms) ? null : ms;
+}
+
+// Identifica os abertoIds inteiros seguros para arquivar. Duas regras de elegibilidade,
+// por tipo de ciclo:
+//  - Ciclos ABERTURA→FECHAMENTO: sujeitos à regra "zero-crossing" de _calcularSaldoReplay
+//    (linha ~2602) — só é seguro arquivar um FECHAMENTO estritamente anterior ao último
+//    "reset" da sua chave (nrSerie+codItem+operacao), porque o replay do saldo nunca olha
+//    pra trás desse ponto. Um lote com N séries só é elegível quando TODAS as N séries já
+//    cruzaram essa fronteira — nunca parcialmente (senão o FECHAMENTO de uma série ainda
+//    ativa sumiria do replay da sua própria chave).
+//  - Ciclos INÍCIO/TÉRMINO DE RETRABALHO e paradas standalone: não tocam Saldo_Parcial (só
+//    FECHAMENTO entra no replay), então só precisam estar FECHADOS (têm o evento de término)
+//    + margem de segurança — sem risco de zero-crossing.
+// Em ambos os casos, também vale ARQUIVAMENTO_MARGEM_DIAS (dataLimiteMs) — não arquiva nada
+// fechado recentemente, pra deixar folga para correções administrativas via editarApontamento.
+// Retorna o Set de abertoIds elegíveis. Quem chama usa esse conjunto para incluir toda linha
+// cujo ABERTO_ID (ou ABERTO_ID_PAI, no caso de paradas/retrabalhos aninhados) esteja nele —
+// a unidade de arquivamento é sempre o abertoId inteiro, nunca uma linha isolada.
+function _identificarElegiveisArquivamento(dadosRe, dataLimiteMs) {
+  const TIPOS_FECHAMENTO_AUX = new Set(['TÉRMINO DE RETRABALHO', 'TÉRMINO DE PARADA']);
+
+  const porChave = {};                 // chave -> [{idx, carimboMs, qtdPlanejada, qtdRealizada, abertoId}]
+  const fechamentoAuxPorAbertoId = {};  // abertoId -> carimboMs do término (retrabalho/parada standalone)
+
+  for (let i = 1; i < dadosRe.length; i++) {
+    const row = dadosRe[i];
+    const tipo = String(row[COL_RE.TIPO] || '').trim();
+    const abertoId = String(row[COL_RE.ABERTO_ID] || '').trim();
+    if (tipo === 'FECHAMENTO') {
+      const nrSerie  = String(row[COL_RE.SERIE] || '').split('|')[0].trim();
+      const codItem  = String(row[COL_RE.COD_ITEM] || '').trim();
+      const operacao = String(row[COL_RE.OPERACAO] || '').substring(0, 4);
+      const chave = nrSerie + '::' + codItem + '::' + operacao;
+      if (!porChave[chave]) porChave[chave] = [];
+      porChave[chave].push({
+        idx: i,
+        carimboMs: _carimboArquivamentoMs(row[COL_RE.CARIMBO]),
+        qtdPlanejada: Number(row[COL_RE.QTD_PLANEJADA]) || 0,
+        qtdRealizada: Number(row[COL_RE.QTD]) || 0,
+        abertoId: abertoId,
+      });
+    } else if (TIPOS_FECHAMENTO_AUX.has(tipo) && abertoId) {
+      fechamentoAuxPorAbertoId[abertoId] = _carimboArquivamentoMs(row[COL_RE.CARIMBO]);
+    }
+  }
+
+  // Replay por chave (mesma regra de _calcularSaldoReplay) — marca quais índices de FECHAMENTO
+  // ficam estritamente antes do último reset (ou, se a chave zerou no fim, TODOS os eventos).
+  const idxFechamentoElegivel = new Set();
+  const fechamentosPorAbertoId = {}; // abertoId -> [idx, ...] — todos os FECHAMENTOs daquele id
+  Object.keys(porChave).forEach(chave => {
+    const eventos = porChave[chave];
+    let saldo = null;
+    let ultimoResetPos = 0;
+    eventos.forEach((ev, pos) => {
+      if (saldo === null || saldo <= 0) { saldo = Math.max(0, ev.qtdPlanejada - ev.qtdRealizada); ultimoResetPos = pos; }
+      else { saldo = Math.max(0, saldo - ev.qtdRealizada); }
+      if (ev.abertoId) (fechamentosPorAbertoId[ev.abertoId] || (fechamentosPorAbertoId[ev.abertoId] = [])).push(ev.idx);
+    });
+    const limitePos = (saldo === 0) ? eventos.length : ultimoResetPos;
+    for (let pos = 0; pos < limitePos; pos++) {
+      const ev = eventos[pos];
+      if (ev.abertoId && ev.carimboMs && ev.carimboMs < dataLimiteMs) idxFechamentoElegivel.add(ev.idx);
+    }
+  });
+
+  const abertoIdsElegiveis = new Set();
+  // Um abertoId de lote pode ter N FECHAMENTOs (um por série) — só elegível se TODOS cruzaram
+  // a fronteira de segurança, nunca parcialmente.
+  Object.keys(fechamentosPorAbertoId).forEach(id => {
+    const idxs = fechamentosPorAbertoId[id];
+    if (idxs.every(idx => idxFechamentoElegivel.has(idx))) abertoIdsElegiveis.add(id);
+  });
+  Object.keys(fechamentoAuxPorAbertoId).forEach(id => {
+    if (abertoIdsElegiveis.has(id)) return; // não deveria colidir com a regra acima, mas por garantia
+    const ms = fechamentoAuxPorAbertoId[id];
+    if (ms && ms < dataLimiteMs) abertoIdsElegiveis.add(id);
+  });
+
+  return abertoIdsElegiveis;
+}
+
+// Expande o Set de abertoIds elegíveis pra todos os índices de linha (em dadosRe) que devem
+// se mover junto — a própria ABERTURA/FECHAMENTO(s) do id, e qualquer linha aninhada (parada/
+// retrabalho) cujo ABERTO_ID_PAI aponte pra ele.
+function _linhasParaArquivar(dadosRe, abertoIdsElegiveis) {
+  const idxs = [];
+  for (let i = 1; i < dadosRe.length; i++) {
+    const row = dadosRe[i];
+    const meuId = String(row[COL_RE.ABERTO_ID] || '').trim();
+    const idPai = String(row[COL_RE.ABERTO_ID_PAI] || '').trim();
+    if ((meuId && abertoIdsElegiveis.has(meuId)) || (idPai && abertoIdsElegiveis.has(idPai))) {
+      idxs.push(i);
+    }
+  }
+  return idxs;
+}
+
+function _preencherColunas(row, numColunas) {
+  if (row.length === numColunas) return row;
+  const r = row.slice(0, numColunas);
+  while (r.length < numColunas) r.push('');
+  return r;
+}
+
+// Dry-run: identifica o que SERIA arquivado, sem mover nada. Espelha o padrão já usado em
+// previewAberturasOrfas/deletarAberturasOrfas (linha ~7203) pra uma operação destrutiva similar.
+function previewArquivamento(margemDias) {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const abaRe = ss.getSheetByName(ABA_RESPOSTAS);
+  if (!abaRe) return { success: false, message: 'Aba Respostas não encontrada.' };
+  const dadosRe = abaRe.getDataRange().getValues();
+  if (dadosRe.length < 2) return { success: true, abertoIdsElegiveis: 0, linhasElegiveis: 0, amostra: [] };
+
+  const dias = Number(margemDias) > 0 ? Number(margemDias) : ARQUIVAMENTO_MARGEM_DIAS;
+  const dataLimiteMs = Date.now() - dias * 24 * 60 * 60 * 1000;
+
+  const abertoIdsElegiveis = _identificarElegiveisArquivamento(dadosRe, dataLimiteMs);
+  const idxs = _linhasParaArquivar(dadosRe, abertoIdsElegiveis);
+
+  const amostra = idxs.slice(0, 20).map(i => ({
+    sheetRow: i + 1,
+    carimbo:  formatarCarimboGs(dadosRe[i][COL_RE.CARIMBO]),
+    tipo:     dadosRe[i][COL_RE.TIPO],
+    nrSerie:  String(dadosRe[i][COL_RE.SERIE] || '').split('|')[0].trim(),
+    codItem:  dadosRe[i][COL_RE.COD_ITEM],
+    abertoId: dadosRe[i][COL_RE.ABERTO_ID],
+  }));
+
+  return {
+    success: true,
+    margemDias: dias,
+    totalLinhasRespostas: dadosRe.length - 1,
+    abertoIdsElegiveis: abertoIdsElegiveis.size,
+    linhasElegiveis: idxs.length,
+    amostra: amostra,
+  };
+}
+
+// Move de verdade as linhas elegíveis pra Historico. Nunca faz deleteRow em loop linha-a-linha
+// (O(n²) numa aba com milhares de linhas) — calcula o estado final em memória (mantidas vs.
+// arquivadas) e escreve tudo de uma vez, mesmo padrão de recalcularSaldoParcialLote (~linha 2692).
+// Segura o lock global (mesma seção crítica de gravarApontamento) — corre em horário de baixo
+// tráfego (trigger diário de madrugada), então bloquear escritas durante essa janela é aceitável.
+function executarArquivamento(margemDias) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(30000);
+  } catch (lockErr) {
+    return { success: false, message: 'Servidor ocupado. Tente novamente em instantes.' };
+  }
+  try {
+    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+    const abaRe = ss.getSheetByName(ABA_RESPOSTAS);
+    if (!abaRe) return { success: false, message: 'Aba Respostas não encontrada.' };
+    const dadosRe = abaRe.getDataRange().getValues();
+    if (dadosRe.length < 2) return { success: true, arquivados: 0, message: 'Sem dados.' };
+
+    const dias = Number(margemDias) > 0 ? Number(margemDias) : ARQUIVAMENTO_MARGEM_DIAS;
+    const dataLimiteMs = Date.now() - dias * 24 * 60 * 60 * 1000;
+
+    const abertoIdsElegiveis = _identificarElegiveisArquivamento(dadosRe, dataLimiteMs);
+    const idxsArquivar = new Set(_linhasParaArquivar(dadosRe, abertoIdsElegiveis));
+
+    if (idxsArquivar.size === 0) {
+      return { success: true, arquivados: 0, message: 'Nenhuma linha elegível pra arquivar.' };
+    }
+
+    const linhasMantidas   = [dadosRe[0]];
+    const linhasArquivadas = [];
+    for (let i = 1; i < dadosRe.length; i++) {
+      if (idxsArquivar.has(i)) linhasArquivadas.push(dadosRe[i]);
+      else linhasMantidas.push(dadosRe[i]);
+    }
+
+    const abaHist = garantirAbaHistorico(ss);
+    const numColunas = Math.max(abaRe.getLastColumn(), abaHist.getLastColumn());
+
+    // Append em lote no Historico, preservando a ordem cronológica das linhas arquivadas.
+    const proximaLinhaHist = abaHist.getLastRow() + 1;
+    abaHist.getRange(proximaLinhaHist, 1, linhasArquivadas.length, numColunas)
+      .setValues(linhasArquivadas.map(r => _preencherColunas(r, numColunas)));
+
+    // Reescreve Respostas: limpa o corpo e escreve só as linhas mantidas.
+    if (dadosRe.length > 1) {
+      abaRe.getRange(2, 1, dadosRe.length - 1, numColunas).clearContent();
+    }
+    if (linhasMantidas.length > 1) {
+      abaRe.getRange(2, 1, linhasMantidas.length - 1, numColunas)
+        .setValues(linhasMantidas.slice(1).map(r => _preencherColunas(r, numColunas)));
+    }
+    SpreadsheetApp.flush();
+
+    return {
+      success: true,
+      arquivados: linhasArquivadas.length,
+      abertoIdsArquivados: abertoIdsElegiveis.size,
+      restantesEmRespostas: linhasMantidas.length - 1,
+      message: linhasArquivadas.length + ' linha(s) movida(s) pra ' + ABA_HISTORICO + '.',
+    };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 function garantirAbaSaldo(ss) {
   let aba = ss.getSheetByName(ABA_SALDO);
   if (!aba) {
@@ -3721,6 +3989,26 @@ function criarTriggerReconciliacaoAbertos() {
     .create();
 
   Logger.log('Trigger criado: reconstruirAbertos a cada 30 minutos.');
+}
+
+// ================================================================
+// TRIGGER — Arquivamento diário de histórico (ver executarArquivamento, ~linha 2560)
+// Execute criarTriggerArquivamento() uma vez para ativar. Só ativar depois de validar
+// manualmente com previewArquivamento + algumas execuções manuais de executarArquivamento.
+// ================================================================
+
+function criarTriggerArquivamento() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'executarArquivamento')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+
+  ScriptApp.newTrigger('executarArquivamento')
+    .timeBased()
+    .atHour(3)
+    .everyDays(1)
+    .create();
+
+  Logger.log('Trigger criado: executarArquivamento diariamente às 3h (GMT-3).');
 }
 
 // ================================================================
@@ -5770,49 +6058,57 @@ function removerRegistroPorAbertoId(idAlvo) {
     return { success: false, message: 'Servidor ocupado. Tente novamente em instantes.' };
   }
   try {
-    const ss    = SpreadsheetApp.openById(SPREADSHEET_ID);
-    const abaRe = ss.getSheetByName(ABA_RESPOSTAS);
-    const abaAb = garantirAbaAbertos(ss);
+    const ss      = SpreadsheetApp.openById(SPREADSHEET_ID);
+    const abaRe   = ss.getSheetByName(ABA_RESPOSTAS);
+    const abaHist = ss.getSheetByName(ABA_HISTORICO); // arquivamento — o registro pode já ter sido movido pra cá
+    const abaAb   = garantirAbaAbertos(ss);
     if (abaRe) removerFiltroSeExistir(abaRe);
     if (abaAb) removerFiltroSeExistir(abaAb);
-    let removidosRe = 0;
-    let removidosAb = 0;
     // Bug fix: ao remover FECHAMENTOs, o Saldo_Parcial daquela chave (série+item+operação)
     // fica órfão com um valor desatualizado se não for recalculado depois da remoção.
     const chavesSaldoParaRecalcular = [];
 
-    // Remove de Respostas (col P = índice 15)
     // Perf fix: antes fazia clearContents() + reescrevia TODAS as linhas válidas de volta —
-    // custoso numa planilha com milhares de linhas pra remover só 1-8. Agora usa deleteRows()
+    // custoso numa planilha com milhares de linhas pra remover só 1-8. Usa deleteRows()
     // direcionado nas linhas que batem, de baixo pra cima (evita deslocamento de índice).
-    // dadosRePosRemocao guarda a versão em memória já sem as linhas removidas, reaproveitada
-    // no recálculo de saldo abaixo — evita uma segunda leitura completa da planilha.
-    let dadosRePosRemocao = null;
-    if (abaRe) {
-      const dadosRe = abaRe.getDataRange().getValues();
+    // Varre a aba dada (Respostas OU Historico) e devolve as linhas restantes (com cabeçalho),
+    // reaproveitadas no recálculo de saldo abaixo — evita uma segunda leitura completa.
+    function removerDeAba(aba) {
+      if (!aba) return { restantes: [[]], removidos: 0 };
+      const dados = aba.getDataRange().getValues();
       const linhasParaRemover = [];
-      dadosRePosRemocao = [dadosRe[0]]; // mantém cabeçalho
-      for (let i = 1; i < dadosRe.length; i++) {
-        if (String(dadosRe[i][15] || '').trim() === idAlvo) {
-          removidosRe++;
+      const restantes = [dados[0]];
+      for (let i = 1; i < dados.length; i++) {
+        if (String(dados[i][15] || '').trim() === idAlvo) {
           linhasParaRemover.push(i + 1); // linha na planilha (1-indexed)
-          if (String(dadosRe[i][2] || '').trim() === 'FECHAMENTO') {
+          if (String(dados[i][2] || '').trim() === 'FECHAMENTO') {
             chavesSaldoParaRecalcular.push({
-              nrSerie:  String(dadosRe[i][5] || '').split('|')[0].trim(),
-              codItem:  String(dadosRe[i][4] || '').trim(),
-              operacao: String(dadosRe[i][3] || '').substring(0, 4),
+              nrSerie:  String(dados[i][5] || '').split('|')[0].trim(),
+              codItem:  String(dados[i][4] || '').trim(),
+              operacao: String(dados[i][3] || '').substring(0, 4),
             });
           }
         } else {
-          dadosRePosRemocao.push(dadosRe[i]);
+          restantes.push(dados[i]);
         }
       }
-      for (let k = linhasParaRemover.length - 1; k >= 0; k--) {
-        abaRe.deleteRow(linhasParaRemover[k]);
-      }
+      for (let k = linhasParaRemover.length - 1; k >= 0; k--) aba.deleteRow(linhasParaRemover[k]);
+      return { restantes, removidos: linhasParaRemover.length };
     }
 
+    const resRe   = removerDeAba(abaRe);
+    const resHist = removerDeAba(abaHist);
+    const removidosRe   = resRe.removidos;
+    const removidosHist = resHist.removidos;
+
+    // Estado pós-remoção mesclado (Historico + Respostas, ordem cronológica) — pra recálculo
+    // de saldo correto mesmo se a linha removida já estava arquivada.
+    const dadosRePosRemocao = [resRe.restantes[0] || resHist.restantes[0] || []]
+      .concat(resHist.restantes.slice(1))
+      .concat(resRe.restantes.slice(1));
+
     // Remove de Abertos (col 12 = índice 12)
+    let removidosAb = 0;
     if (abaAb) {
       const dadosAb = abaAb.getDataRange().getValues();
       for (let i = dadosAb.length - 1; i >= 1; i--) {
@@ -5827,16 +6123,17 @@ function removerRegistroPorAbertoId(idAlvo) {
     if (removidosAb > 0) invalidarCacheAbertos(); // Opção A: invalida o cache curto se Abertos mudou
 
     // Recalcula Saldo_Parcial (do zero, replay) para cada chave afetada pelos FECHAMENTOs removidos.
-    // Passa dadosRePosRemocao (já em memória, já sem as linhas removidas) — evita reler a planilha.
+    // Passa dadosRePosRemocao (já em memória, já mesclado e sem as linhas removidas).
     chavesSaldoParaRecalcular.forEach(c => {
       if (c.nrSerie && c.codItem) recalcularSaldoParcial(c.nrSerie, c.codItem, c.operacao, dadosRePosRemocao);
     });
 
     return {
       removidosRespostas: removidosRe,
+      removidosHistorico: removidosHist,
       removidosAbertos: removidosAb,
       saldoRecalculado: chavesSaldoParaRecalcular.length > 0,
-      mensagem: `ID ${idAlvo}: ${removidosRe} linha(s) removida(s) de Respostas, ${removidosAb} de Abertos.`
+      mensagem: `ID ${idAlvo}: ${removidosRe} linha(s) removida(s) de Respostas, ${removidosHist} de ${ABA_HISTORICO}, ${removidosAb} de Abertos.`
     };
   } finally {
     lock.releaseLock();
@@ -5850,23 +6147,31 @@ function removerRegistroPorAbertoId(idAlvo) {
 // Execute via: ?action=removerPorCarimboECodItem&key=AGF2026&carimbo=...&codItem=...
 // ================================================================
 function removerRegistroPorCarimboECodItem(carimbo, codItem) {
-  const ss    = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const abaRe = ss.getSheetByName(ABA_RESPOSTAS);
-  let removidos = 0;
-  if (abaRe) {
-    const dadosRe = abaRe.getDataRange().getValues();
-    for (let i = dadosRe.length - 1; i >= 1; i--) {
-      const carimboLinha = dadosRe[i][0] instanceof Date
-        ? Utilities.formatDate(dadosRe[i][0], 'GMT-3', 'dd/MM/yyyy HH:mm:ss')
-        : String(dadosRe[i][0] || '');
-      if (carimboLinha === carimbo && String(dadosRe[i][4] || '') === codItem) {
-        abaRe.deleteRow(i + 1);
-        removidos++;
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+
+  function removerDeAba(aba) {
+    if (!aba) return 0;
+    let n = 0;
+    const dados = aba.getDataRange().getValues();
+    for (let i = dados.length - 1; i >= 1; i--) {
+      const carimboLinha = dados[i][0] instanceof Date
+        ? Utilities.formatDate(dados[i][0], 'GMT-3', 'dd/MM/yyyy HH:mm:ss')
+        : String(dados[i][0] || '');
+      if (carimboLinha === carimbo && String(dados[i][4] || '') === codItem) {
+        aba.deleteRow(i + 1);
+        n++;
       }
     }
+    return n;
   }
+
+  // Registro-alvo pode já ter sido arquivado — procura nas duas abas.
+  const removidosRe   = removerDeAba(ss.getSheetByName(ABA_RESPOSTAS));
+  const removidosHist = removerDeAba(ss.getSheetByName(ABA_HISTORICO));
+  const removidos = removidosRe + removidosHist;
   SpreadsheetApp.flush();
-  return { removidos, mensagem: `${removidos} linha(s) removida(s) com carimbo "${carimbo}" e codItem "${codItem}".` };
+  return { removidos, removidosRespostas: removidosRe, removidosHistorico: removidosHist,
+    mensagem: `${removidos} linha(s) removida(s) com carimbo "${carimbo}" e codItem "${codItem}".` };
 }
 
 // ================================================================
@@ -5907,24 +6212,37 @@ function editarApontamento(payload) {
     if (!abertoId) return jsonResponse({ success: false, message: 'abertoId é obrigatório.' });
     if (!TIPOS_APONTAMENTO[tipoAlvo]) return jsonResponse({ success: false, message: 'tipoAlvo inválido: "' + tipoAlvo + '".' });
 
-    const ss    = SpreadsheetApp.openById(SPREADSHEET_ID);
-    const abaRe = ss.getSheetByName(ABA_RESPOSTAS);
+    const ss      = SpreadsheetApp.openById(SPREADSHEET_ID);
+    const abaRe   = ss.getSheetByName(ABA_RESPOSTAS);
+    const abaHist = ss.getSheetByName(ABA_HISTORICO); // arquivamento — o registro pode já estar aqui
     if (!abaRe) return jsonResponse({ success: false, message: 'Aba "' + ABA_RESPOSTAS + '" não encontrada.' });
-    const dadosRe = abaRe.getDataRange().getValues();
 
     const tipoFormatadoAlvo = TIPOS_APONTAMENTO[tipoAlvo];
-    let linhaIdx = -1;
-    for (let i = 1; i < dadosRe.length; i++) {
-      if (String(dadosRe[i][COL_RE.ABERTO_ID] || '').trim() !== abertoId) continue;
-      if (String(dadosRe[i][COL_RE.TIPO] || '').trim() !== tipoFormatadoAlvo) continue;
-      const serieLinha = String(dadosRe[i][COL_RE.SERIE] || '').split('|')[0].trim();
-      if (serieLinha !== nrSerieAlvo) continue;
-      linhaIdx = i;
-      break;
+    // Procura primeiro na aba viva, depois no Historico — ferramenta de correção admin
+    // explicitamente pode mirar num registro antigo já arquivado.
+    function localizarLinha(aba) {
+      if (!aba) return null;
+      const dados = aba.getDataRange().getValues();
+      for (let i = 1; i < dados.length; i++) {
+        if (String(dados[i][COL_RE.ABERTO_ID] || '').trim() !== abertoId) continue;
+        if (String(dados[i][COL_RE.TIPO] || '').trim() !== tipoFormatadoAlvo) continue;
+        const serieLinha = String(dados[i][COL_RE.SERIE] || '').split('|')[0].trim();
+        if (serieLinha !== nrSerieAlvo) continue;
+        return { aba, dados, linhaIdx: i };
+      }
+      return null;
     }
-    if (linhaIdx === -1) {
+    const alvo = localizarLinha(abaRe) || localizarLinha(abaHist);
+    if (!alvo) {
       return jsonResponse({ success: false, message: 'Registro não encontrado (abertoId/tipo/série não correspondem a nenhuma linha).' });
     }
+    // abaAlvo/dadosRe/linhaIdx a partir daqui sempre se referem à aba ONDE O REGISTRO FOI
+    // ACHADO (viva ou Historico) — mantém a checagem de duplicidade abaixo e a escrita no
+    // mesmo universo consistente (um lote arquivado tem todas as suas linhas juntas na
+    // mesma aba, nunca espalhadas).
+    const abaAlvo = alvo.aba;
+    const dadosRe = alvo.dados;
+    const linhaIdx = alvo.linhaIdx;
 
     const linhaAntiga = [...dadosRe[linhaIdx]];
     const tiposAbertura = ['ABERTURA', 'INICIO_RETRABALHO', 'INICIO_PARADA'];
@@ -6029,7 +6347,7 @@ function editarApontamento(payload) {
     if (nv.obs2 !== undefined)          linhaNova[COL_RE.OBS2] = nv.obs2;
     if (nv.qtdPlanejada !== undefined)  linhaNova[COL_RE.QTD_PLANEJADA] = nv.qtdPlanejada === '' ? '' : Number(nv.qtdPlanejada);
 
-    abaRe.getRange(linhaIdx + 1, 1, 1, linhaNova.length).setValues([linhaNova]);
+    abaAlvo.getRange(linhaIdx + 1, 1, 1, linhaNova.length).setValues([linhaNova]);
     // Reflete a edição na cópia em memória — reaproveitada no recálculo de saldo abaixo,
     // evitando uma releitura completa da planilha que acabamos de escrever.
     dadosRe[linhaIdx] = linhaNova;
@@ -6082,9 +6400,13 @@ function editarApontamento(payload) {
       const itemNovo  = nv.codItem  !== undefined ? String(nv.codItem).trim() : itemAntigo;
       const serieNova = nv.nrSerie  !== undefined ? String(nv.nrSerie).trim() : serieAntiga;
 
-      recalcularSaldoParcial(serieAntiga, itemAntigo, opAntiga, dadosRe);
+      // Leitura mesclada (viva + Historico) — o registro editado pode ter sido um FECHAMENTO
+      // já arquivado; sem isso o replay da chave ficaria incompleto (só veria a aba viva).
+      // Já refletimos o flush acima, então esta leitura já enxerga a edição aplicada.
+      const dadosParaReplay = _lerRespostasComHistorico(ss);
+      recalcularSaldoParcial(serieAntiga, itemAntigo, opAntiga, dadosParaReplay);
       if (serieNova !== serieAntiga || itemNovo !== itemAntigo || opNova !== opAntiga) {
-        recalcularSaldoParcial(serieNova, itemNovo, opNova, dadosRe);
+        recalcularSaldoParcial(serieNova, itemNovo, opNova, dadosParaReplay);
       }
       saldoRecalculado = true;
     }
@@ -6397,7 +6719,8 @@ function analisarInconsistencias() {
   const aba = ss.getSheetByName(ABA_RESPOSTAS);
   if (!aba) return { success: false, message: 'Aba Respostas não encontrada.' };
 
-  const dados = aba.getDataRange().getValues();
+  // Auditoria de histórico completo — inclui Historico (arquivamento), não só a aba viva.
+  const dados = _lerRespostasComHistorico(ss);
   if (dados.length < 2) return { success: false, message: 'Sem dados.' };
 
   // ── PARSE REGISTROS ──────────────────────────────────────────
@@ -6601,26 +6924,44 @@ function analisarOrfaos() {
 // dryRun=true  → apenas lista o que seria excluído (padrão)
 // dryRun=false → excluí efetivamente (irreversível)
 // ================================================================
-function excluirFechamentosOrfaos(dryRun) {
-  const ss    = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const sheet = ss.getSheetByName(ABA_RESPOSTAS);
-  const data  = sheet.getDataRange().getValues();
+// Como _lerRespostasComHistorico, mas cada linha retornada sabe de qual aba (e qual número de
+// linha real nela) veio — necessário pra ferramentas que precisam DELETAR por posição real, não
+// só ler. Um FECHAMENTO órfão pode ter sido arquivado antes de alguém notar que era órfão (o
+// arquivamento não valida pareamento fuzzy, só a regra de saldo por chave) — precisa saber em
+// qual aba deletar.
+function _lerRespostasComHistoricoRastreado(ss) {
+  const abaRe   = ss.getSheetByName(ABA_RESPOSTAS);
+  const dadosRe = abaRe ? abaRe.getDataRange().getValues() : [[]];
+  const abaHist = ss.getSheetByName(ABA_HISTORICO);
+  const dadosHist = (abaHist && abaHist.getLastRow() >= 2) ? abaHist.getDataRange().getValues() : null;
 
-  // Monta registros com índice de linha real na planilha (1-based)
-  // Filtro idêntico ao analisarInconsistencias: exige operador E tipo preenchidos
+  const linhas = [];
+  if (dadosHist) {
+    for (let i = 1; i < dadosHist.length; i++) linhas.push({ row: dadosHist[i], aba: abaHist, sheetRow: i + 1 });
+  }
+  for (let i = 1; i < dadosRe.length; i++) linhas.push({ row: dadosRe[i], aba: abaRe, sheetRow: i + 1 });
+  return linhas;
+}
+
+function excluirFechamentosOrfaos(dryRun) {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+
+  // Auditoria de histórico completo (viva + Historico) — filtro idêntico ao
+  // analisarInconsistencias: exige operador E tipo preenchidos.
   const records = [];
-  for (let i = 1; i < data.length; i++) {
-    const r = lerLinhaRespostas(data[i]);
-    if (!r.operador || !r.tipo) continue;   // mesmo filtro de analisarInconsistencias
+  _lerRespostasComHistoricoRastreado(ss).forEach(({ row, aba, sheetRow }) => {
+    const r = lerLinhaRespostas(row);
+    if (!r.operador || !r.tipo) return;
     const tsMs = parseCarimboGsMs(r.carimbo);
-    if (!tsMs || isNaN(tsMs)) continue;
+    if (!tsMs || isNaN(tsMs)) return;
     records.push({
       tipo: r.tipo, func: r.operador, op: r.operacao,
       serie: r.nrSerie, item: r.codItem, tsMs,
       abertoId: r.abertoId,
-      rowIndex: i + 1   // linha na planilha (cabeçalho = linha 1)
+      aba, sheetRow,
+      id: records.length, // identidade única no conjunto combinado (duas abas têm "linha 5" cada)
     });
-  }
+  });
 
   // Algoritmo de pareamento idêntico ao analisarInconsistencias
   const TOLERANCIA_MS = 5 * 60 * 1000;
@@ -6656,37 +6997,46 @@ function excluirFechamentosOrfaos(dryRun) {
 
       if (best !== null) {
         opens[best]._used = true;
-        pairs.push({ fechRowIndex: r.rowIndex, aberRowIndex: opens[best].rowIndex });
+        pairs.push({ fechId: r.id, aberId: opens[best].id });
       }
       // Se best === null: FECHAMENTO é órfão — será marcado abaixo
     }
   });
 
-  const pairedCloseRows = new Set(pairs.map(p => p.fechRowIndex));
-  const orfaos = records.filter(r =>
-    r.tipo === 'FECHAMENTO' && !pairedCloseRows.has(r.rowIndex)
-  );
+  const pairedCloseIds = new Set(pairs.map(p => p.fechId));
+  const orfaos = records.filter(r => r.tipo === 'FECHAMENTO' && !pairedCloseIds.has(r.id));
 
   if (dryRun) {
     return {
       success: true, dryRun: true,
       total: orfaos.length,
       registros: orfaos.map(r => ({
-        row: r.rowIndex,
+        row: r.sheetRow, aba: r.aba.getName(),
         func: r.func, op: r.op,
         ts: Utilities.formatDate(new Date(r.tsMs), 'America/Sao_Paulo', 'dd/MM/yyyy HH:mm')
       }))
     };
   }
 
-  // Execução: apagar de baixo para cima (para não deslocar índices)
-  const rowsDesc = orfaos.map(r => r.rowIndex).sort((a, b) => b - a);
-  rowsDesc.forEach(row => sheet.deleteRow(row));
+  // Execução: apaga de baixo pra cima, DENTRO DE CADA ABA separadamente — cada aba tem sua
+  // própria numeração de linha, misturar índices entre abas corromperia a linha errada.
+  const porAba = {};
+  orfaos.forEach(r => {
+    const nome = r.aba.getName();
+    if (!porAba[nome]) porAba[nome] = { aba: r.aba, linhas: [] };
+    porAba[nome].linhas.push(r.sheetRow);
+  });
+  let totalExcluidas = 0;
+  Object.keys(porAba).forEach(nome => {
+    const { aba, linhas } = porAba[nome];
+    linhas.sort((a, b) => b - a).forEach(row => aba.deleteRow(row));
+    totalExcluidas += linhas.length;
+  });
 
   return {
     success: true, dryRun: false,
-    linhasExcluidas: rowsDesc.length,
-    mensagem: rowsDesc.length + ' FECHAMENTOs órfãos excluídos.'
+    linhasExcluidas: totalExcluidas,
+    mensagem: totalExcluidas + ' FECHAMENTOs órfãos excluídos.'
   };
 }
 
@@ -7042,7 +7392,8 @@ function impactoOrfaos() {
   const aba = ss.getSheetByName(ABA_RESPOSTAS);
   if (!aba) return { success: false, message: 'Aba Respostas não encontrada.' };
 
-  const dados = aba.getDataRange().getValues();
+  // Auditoria de histórico completo (tendência mensal desde o início) — inclui Historico.
+  const dados = _lerRespostasComHistorico(ss);
   if (dados.length < 2) return { success: false, message: 'Sem dados.' };
 
   function fmtTs(ms) {
@@ -7648,8 +7999,8 @@ function _removerTesteBlindagem() { return _removerSaldoPorAbertoId('AP-B2B2E2D9
 // ================================================================
 function _diagPokaYokeFalhas() {
   const ss    = SpreadsheetApp.openById(SPREADSHEET_ID);
-  const abaRe = ss.getSheetByName(ABA_RESPOSTAS);
-  const dados = abaRe.getDataRange().getValues();
+  // Auditoria post-mortem de histórico completo — inclui Historico.
+  const dados = _lerRespostasComHistorico(ss);
 
   const TIPOS_ABERTURA_SET   = new Set(['ABERTURA', 'INÍCIO DE RETRABALHO', 'INÍCIO DE PARADA']);
   const TIPOS_FECHAMENTO_SET = new Set(['FECHAMENTO', 'TÉRMINO DE RETRABALHO', 'TÉRMINO DE PARADA']);
@@ -7814,10 +8165,11 @@ function _diagPokaYokeStatusAtual() {
   if (!abaDiag) return { erro: 'Rode _diagPokaYokeFalhas primeiro.' };
   const dadosDiag = abaDiag.getDataRange().getValues();
 
-  const abaRe = ss.getSheetByName(ABA_RESPOSTAS);
-  const dadosRe = abaRe.getDataRange().getValues();
-  // Conjunto de abertoIds que JÁ TÊM um fechamento correspondente em Respostas (qualquer tipo
-  // de fechamento) — se o abertoId anterior está aqui, já foi resolvido, mesmo que tardiamente.
+  // Precisa do histórico completo (viva + Historico) — um abertoId antigo pode ter sido
+  // fechado há muito tempo e já arquivado; sem isso, pareceria "ainda pendente" incorretamente.
+  const dadosRe = _lerRespostasComHistorico(ss);
+  // Conjunto de abertoIds que JÁ TÊM um fechamento correspondente (qualquer tipo de fechamento)
+  // — se o abertoId anterior está aqui, já foi resolvido, mesmo que tardiamente.
   const TIPOS_FECHAMENTO_SET = new Set(['FECHAMENTO', 'TÉRMINO DE RETRABALHO', 'TÉRMINO DE PARADA'].map(s => s.normalize('NFC')));
   const abertoIdsFechados = new Set();
   for (let i = 1; i < dadosRe.length; i++) {
