@@ -2632,7 +2632,11 @@ function previewArquivamento(margemDias) {
   const dadosRe = abaRe.getDataRange().getValues();
   if (dadosRe.length < 2) return { success: true, abertoIdsElegiveis: 0, linhasElegiveis: 0, amostra: [] };
 
-  const dias = Number(margemDias) > 0 ? Number(margemDias) : ARQUIVAMENTO_MARGEM_DIAS;
+  // Number(margemDias) > 0 trataria "0" como "nao informado" (0 e falsy) — checa presenca
+  // explicitamente, pra permitir margemDias=0 (usado em teste, arquiva tudo elegivel na hora).
+  const diasNum = Number(margemDias);
+  const dias = (margemDias !== undefined && margemDias !== null && margemDias !== '' && !isNaN(diasNum) && diasNum >= 0)
+    ? diasNum : ARQUIVAMENTO_MARGEM_DIAS;
   const dataLimiteMs = Date.now() - dias * 24 * 60 * 60 * 1000;
 
   const abertoIdsElegiveis = _identificarElegiveisArquivamento(dadosRe, dataLimiteMs);
@@ -2676,7 +2680,11 @@ function executarArquivamento(margemDias) {
     const dadosRe = abaRe.getDataRange().getValues();
     if (dadosRe.length < 2) return { success: true, arquivados: 0, message: 'Sem dados.' };
 
-    const dias = Number(margemDias) > 0 ? Number(margemDias) : ARQUIVAMENTO_MARGEM_DIAS;
+    // Number(margemDias) > 0 trataria "0" como "nao informado" (0 e falsy) — checa presenca
+  // explicitamente, pra permitir margemDias=0 (usado em teste, arquiva tudo elegivel na hora).
+  const diasNum = Number(margemDias);
+  const dias = (margemDias !== undefined && margemDias !== null && margemDias !== '' && !isNaN(diasNum) && diasNum >= 0)
+    ? diasNum : ARQUIVAMENTO_MARGEM_DIAS;
     const dataLimiteMs = Date.now() - dias * 24 * 60 * 60 * 1000;
 
     const abertoIdsElegiveis = _identificarElegiveisArquivamento(dadosRe, dataLimiteMs);
