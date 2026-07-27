@@ -2569,6 +2569,25 @@ function _carimboArquivamentoMs(raw) {
 // Retorna o Set de abertoIds elegíveis. Quem chama usa esse conjunto para incluir toda linha
 // cujo ABERTO_ID (ou ABERTO_ID_PAI, no caso de paradas/retrabalhos aninhados) esteja nele —
 // a unidade de arquivamento é sempre o abertoId inteiro, nunca uma linha isolada.
+// Regra "re-baseia ao zerar", extraída pra um lugar só depois de existir em duas cópias quase-
+// idênticas no arquivo (_calcularSaldoReplay e _identificarElegiveisArquivamento). Recebe uma
+// lista de eventos JÁ EM ORDEM CRONOLÓGICA (cada um só precisa de qtdPlanejada/qtdRealizada) e
+// devolve o saldo final da chave e a posição do último "reset" — o evento que recomeçou o ciclo
+// do zero porque o saldo anterior já tinha zerado. Dali em diante é o "ciclo ativo" atual.
+function _derivarLimitesDeCiclo(eventos) {
+  let saldo = null;
+  let ultimoResetPos = 0;
+  eventos.forEach((ev, pos) => {
+    if (saldo === null || saldo <= 0) {
+      saldo = Math.max(0, ev.qtdPlanejada - ev.qtdRealizada);
+      ultimoResetPos = pos;
+    } else {
+      saldo = Math.max(0, saldo - ev.qtdRealizada);
+    }
+  });
+  return { saldoFinal: saldo, ultimoResetPos };
+}
+
 function _identificarElegiveisArquivamento(dadosRe, dataLimiteMs) {
   const TIPOS_FECHAMENTO_AUX = new Set(['TÉRMINO DE RETRABALHO', 'TÉRMINO DE PARADA']);
 
@@ -2603,14 +2622,13 @@ function _identificarElegiveisArquivamento(dadosRe, dataLimiteMs) {
   const fechamentosPorAbertoId = {}; // abertoId -> [idx, ...] — todos os FECHAMENTOs daquele id
   Object.keys(porChave).forEach(chave => {
     const eventos = porChave[chave];
-    let saldo = null;
-    let ultimoResetPos = 0;
-    eventos.forEach((ev, pos) => {
-      if (saldo === null || saldo <= 0) { saldo = Math.max(0, ev.qtdPlanejada - ev.qtdRealizada); ultimoResetPos = pos; }
-      else { saldo = Math.max(0, saldo - ev.qtdRealizada); }
+    // Bookkeeping de fechamentosPorAbertoId não faz parte da matemática de reset — passa antes,
+    // não importa a ordem.
+    eventos.forEach(ev => {
       if (ev.abertoId) (fechamentosPorAbertoId[ev.abertoId] || (fechamentosPorAbertoId[ev.abertoId] = [])).push(ev.idx);
     });
-    const limitePos = (saldo === 0) ? eventos.length : ultimoResetPos;
+    const { saldoFinal, ultimoResetPos } = _derivarLimitesDeCiclo(eventos);
+    const limitePos = (saldoFinal === 0) ? eventos.length : ultimoResetPos;
     for (let pos = 0; pos < limitePos; pos++) {
       const ev = eventos[pos];
       if (ev.abertoId && ev.carimboMs && ev.carimboMs < dataLimiteMs) idxFechamentoElegivel.add(ev.idx);
@@ -2937,30 +2955,27 @@ function _calcularSaldoReplay(nrSerie, codItemNorm, operacao, dadosRe) {
     });
   }
 
-  let saldo = null;
-  let ultimoCarimbo = '';
-  let ultimoAbertoId = '';
+  // Regra "re-baseia ao zerar": um novo fechamento cujo ciclo anterior já foi concluído
+  // (saldo == 0) inicia um NOVO ciclo de produção — recomeça do plano DELE, não subtrai de 0.
+  // Sem isto, reabrir uma série já concluída (H2.2) com um plano novo daria saldo errado,
+  // pois o replay só olharia o plano do primeiro fechamento. Com a regra, o replay reproduz
+  // exatamente o comportamento do método delta (que zerava removendo a linha), porém de forma
+  // determinística e idempotente — reprocessar a mesma gravação nunca baixa o saldo em dobro.
+  // (lógica de reset compartilhada com _identificarElegiveisArquivamento via _derivarLimitesDeCiclo)
+  const { saldoFinal, ultimoResetPos } = _derivarLimitesDeCiclo(eventos);
+  const ultimo = eventos.length ? eventos[eventos.length - 1] : null;
   let ultimoOperador = '';
-  let baseQtdPlanejada = null;
-  eventos.forEach(ev => {
-    // Regra "re-baseia ao zerar": um novo fechamento cujo ciclo anterior já foi concluído
-    // (saldo == 0) inicia um NOVO ciclo de produção — recomeça do plano DELE, não subtrai de 0.
-    // Sem isto, reabrir uma série já concluída (H2.2) com um plano novo daria saldo errado,
-    // pois o replay só olharia o plano do primeiro fechamento. Com a regra, o replay reproduz
-    // exatamente o comportamento do método delta (que zerava removendo a linha), porém de forma
-    // determinística e idempotente — reprocessar a mesma gravação nunca baixa o saldo em dobro.
-    if (saldo === null || saldo <= 0) {
-      saldo = Math.max(0, ev.qtdPlanejada - ev.qtdRealizada);
-      baseQtdPlanejada = ev.qtdPlanejada;
-    } else {
-      saldo = Math.max(0, saldo - ev.qtdRealizada);
-    }
-    ultimoCarimbo = ev.carimbo;
-    ultimoAbertoId = ev.abertoId;
-    if (ev.operadorCod) ultimoOperador = ev.operadorCod;
-  });
+  for (let i = eventos.length - 1; i >= 0; i--) {
+    if (eventos[i].operadorCod) { ultimoOperador = eventos[i].operadorCod; break; }
+  }
 
-  return { saldo, ultimoCarimbo, ultimoAbertoId, ultimoOperador, baseQtdPlanejada };
+  return {
+    saldo: saldoFinal,
+    ultimoCarimbo: ultimo ? ultimo.carimbo : '',
+    ultimoAbertoId: ultimo ? ultimo.abertoId : '',
+    ultimoOperador,
+    baseQtdPlanejada: eventos.length ? eventos[ultimoResetPos].qtdPlanejada : null,
+  };
 }
 
 function recalcularSaldoParcial(nrSerie, codItem, operacao, dadosRePreCarregado, opts) {
