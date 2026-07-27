@@ -355,6 +355,28 @@ function doGet(e) {
       return jsonResponse({ success: false, message: err.message });
     }
   }
+  if (action === 'diagLinhasPorNumero' && _adminAutorizado(e.parameter.key)) {
+    try {
+      const ss2 = SpreadsheetApp.openById(SPREADSHEET_ID);
+      const nomeAba = e.parameter.aba === 'Historico' ? ABA_HISTORICO : ABA_RESPOSTAS;
+      const aba2 = ss2.getSheetByName(nomeAba);
+      if (!aba2) return jsonResponse({ success: false, message: 'Aba não encontrada.' });
+      const linhas = String(e.parameter.linhas || '').split(',').map(s => parseInt(s.trim())).filter(n => n > 1);
+      const rows = linhas.map(n => {
+        if (n > aba2.getLastRow()) return { sheetRow: n, erro: 'além do fim da aba' };
+        const r = aba2.getRange(n, 1, 1, aba2.getLastColumn()).getValues()[0];
+        return {
+          sheetRow: n, carimbo: String(r[0]), tipo: String(r[2]),
+          serie: String(r[5] || '').substring(0, 40), codItem: String(r[4]),
+          operacao: String(r[3]), abertoId: String(r[15] || ''),
+          cicloId: String(r[COL_RE.CICLO_ID] || ''),
+        };
+      });
+      return jsonResponse({ success: true, aba: nomeAba, rows });
+    } catch(err) {
+      return jsonResponse({ success: false, message: err.message });
+    }
+  }
   if (action === 'analyzeOrphans' && _adminAutorizado(e.parameter.key)) {
     try {
       return jsonResponse(analisarOrfaos());
@@ -419,6 +441,20 @@ function doGet(e) {
     try {
       criarTriggerArquivamento();
       return jsonResponse({ success: true, message: 'Trigger de arquivamento criado: executarArquivamento diariamente às 3h.' });
+    } catch(err) {
+      return jsonResponse({ success: false, message: err.message });
+    }
+  }
+  if (action === 'previewMigracaoCicloId' && _adminAutorizado(e.parameter.key)) {
+    try {
+      return jsonResponse(previewMigracaoCicloId());
+    } catch(err) {
+      return jsonResponse({ success: false, message: err.message });
+    }
+  }
+  if (action === 'executarMigracaoCicloId' && _adminAutorizado(e.parameter.key)) {
+    try {
+      return jsonResponse(executarMigracaoCicloId());
     } catch(err) {
       return jsonResponse({ success: false, message: err.message });
     }
@@ -2651,6 +2687,227 @@ function _identificarElegiveisArquivamento(dadosRe, dataLimiteMs) {
   return abertoIdsElegiveis;
 }
 
+// ================================================================
+// MIGRAÇÃO DE cicloId — histórico existente nunca teve esse campo (introduzido depois, Fase 1).
+// Cobre 4 lugares, nessa ordem: (1) FECHAMENTOs fechados + suas ABERTURAs pareadas, andando
+// cronologicamente por chave com a MESMA regra de reset de _derivarLimitesDeCiclo — cada reset
+// gera um cicloId novo; (2) ABERTURAs ainda abertas sem nenhum FECHAMENTO referenciando seu
+// abertoId — herdam o ciclo pendente da chave (se Saldo_Parcial já mostra saldo>0 pra ela) ou
+// ganham um ciclo novo; (3) a linha correspondente em Abertos, pros itens do item 2 que estão
+// correntemente abertos (flat ou dentro do JSON de lote); (4) Saldo_Parcial — as chaves com
+// saldo pendente precisam do CicloId retroativo, senão a descoberta na abertura (Fase 4) não
+// acha nada pra reaproveitar.
+// Idempotente: só atribui cicloId a quem ainda não tem (checa jaTemCiclo na leitura). Rodar de
+// novo depois que a gravação ao vivo já estiver estampando cicloId é seguro.
+// Paradas/retrabalhos não participam — nunca tocam Saldo_Parcial, não precisam de cicloId.
+// ================================================================
+function _calcularMigracaoCicloId(ss) {
+  const linhasRastreadas = _lerRespostasComHistoricoRastreado(ss);
+
+  const porChave = {};             // chave -> [{aba, sheetRow, abertoId, jaTemCiclo, qtdPlanejada, qtdRealizada}]
+  const aberturaPorChaveEId = {};  // chave -> abertoId -> {aba, sheetRow, jaTemCiclo, resolvida}
+
+  linhasRastreadas.forEach(item => {
+    const row = item.row;
+    const tipo = String(row[COL_RE.TIPO] || '').trim();
+    if (tipo !== 'FECHAMENTO' && tipo !== 'ABERTURA') return; // parada/retrabalho: cicloId não se aplica
+    const nrSerie  = String(row[COL_RE.SERIE] || '').split('|')[0].trim();
+    const codItem  = String(row[COL_RE.COD_ITEM] || '').trim();
+    const operacao = String(row[COL_RE.OPERACAO] || '').substring(0, 4);
+    const chave = nrSerie + '::' + codItem + '::' + operacao;
+    const abertoId = String(row[COL_RE.ABERTO_ID] || '').trim();
+    const jaTemCiclo = String(row[COL_RE.CICLO_ID] || '').trim();
+
+    if (tipo === 'FECHAMENTO') {
+      if (!porChave[chave]) porChave[chave] = [];
+      porChave[chave].push({
+        aba: item.aba, sheetRow: item.sheetRow, abertoId, jaTemCiclo,
+        qtdPlanejada: Number(row[COL_RE.QTD_PLANEJADA]) || 0,
+        qtdRealizada: Number(row[COL_RE.QTD]) || 0,
+      });
+    } else {
+      if (!aberturaPorChaveEId[chave]) aberturaPorChaveEId[chave] = {};
+      // Dentro de uma mesma chave (nrSerie+codItem+operacao), um abertoId só aparece uma vez
+      // como ABERTURA — mesmo em lote, cada série tem sua própria linha/chave distintas.
+      aberturaPorChaveEId[chave][abertoId] = { aba: item.aba, sheetRow: item.sheetRow, jaTemCiclo, resolvida: false };
+    }
+  });
+
+  const atualizacoesLinhas = [];   // {aba, sheetRow, cicloId} — Respostas/Historico
+  const cicloIdFinalPorChave = {};
+  const saldoFinalPorChave = {};
+
+  Object.keys(porChave).forEach(chave => {
+    const eventos = porChave[chave]; // já em ordem cronológica (herdada de _lerRespostasComHistoricoRastreado)
+    let saldo = null;
+    let cicloAtual = null;
+    eventos.forEach(ev => {
+      if (saldo === null || saldo <= 0) {
+        cicloAtual = gerarCicloId();
+        saldo = Math.max(0, ev.qtdPlanejada - ev.qtdRealizada);
+      } else {
+        saldo = Math.max(0, saldo - ev.qtdRealizada);
+      }
+      if (!ev.jaTemCiclo) {
+        atualizacoesLinhas.push({ aba: ev.aba, sheetRow: ev.sheetRow, cicloId: cicloAtual });
+        const abertura = aberturaPorChaveEId[chave] && aberturaPorChaveEId[chave][ev.abertoId];
+        if (abertura && !abertura.jaTemCiclo && !abertura.resolvida) {
+          atualizacoesLinhas.push({ aba: abertura.aba, sheetRow: abertura.sheetRow, cicloId: cicloAtual });
+          abertura.resolvida = true;
+        }
+      }
+    });
+    cicloIdFinalPorChave[chave] = cicloAtual;
+    saldoFinalPorChave[chave] = saldo;
+  });
+
+  // Passada 2: ABERTURAs sem nenhum FECHAMENTO tendo referenciado seu abertoId — ainda abertas
+  // (a maioria dos casos) ou órfãs de verdade (nunca foram fechadas).
+  const aberturasParaAbertos = []; // {chave, abertoId, cicloId} — resolvido contra Abertos depois
+  Object.keys(aberturaPorChaveEId).forEach(chave => {
+    Object.keys(aberturaPorChaveEId[chave]).forEach(abertoId => {
+      const info = aberturaPorChaveEId[chave][abertoId];
+      if (info.resolvida || info.jaTemCiclo) return;
+      const saldoPendente = saldoFinalPorChave[chave];
+      const cicloId = (saldoPendente > 0) ? cicloIdFinalPorChave[chave] : gerarCicloId();
+      atualizacoesLinhas.push({ aba: info.aba, sheetRow: info.sheetRow, cicloId });
+      aberturasParaAbertos.push({ chave, abertoId, cicloId });
+    });
+  });
+
+  // Saldo_Parcial: chaves com saldo pendente precisam do CicloId retroativo.
+  const atualizacoesSaldoParcial = [];
+  Object.keys(saldoFinalPorChave).forEach(chave => {
+    if (saldoFinalPorChave[chave] > 0) {
+      const partes = chave.split('::');
+      atualizacoesSaldoParcial.push({
+        nrSerie: partes[0], codItem: partes[1], operacao: partes[2],
+        cicloId: cicloIdFinalPorChave[chave],
+      });
+    }
+  });
+
+  return { atualizacoesLinhas, atualizacoesSaldoParcial, aberturasParaAbertos };
+}
+
+function previewMigracaoCicloId() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const { atualizacoesLinhas, atualizacoesSaldoParcial, aberturasParaAbertos } = _calcularMigracaoCicloId(ss);
+  return {
+    success: true,
+    linhasAtualizadas: atualizacoesLinhas.length,
+    saldoParcialAtualizados: atualizacoesSaldoParcial.length,
+    abertosParaAtualizar: aberturasParaAbertos.length,
+    amostraLinhas: atualizacoesLinhas.slice(0, 15).map(u => ({ aba: u.aba.getName(), sheetRow: u.sheetRow, cicloId: u.cicloId })),
+    amostraSaldoParcial: atualizacoesSaldoParcial.slice(0, 10),
+    amostraAbertos: aberturasParaAbertos.slice(0, 10),
+  };
+}
+
+function executarMigracaoCicloId() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const { atualizacoesLinhas, atualizacoesSaldoParcial, aberturasParaAbertos } = _calcularMigracaoCicloId(ss);
+
+  if (atualizacoesLinhas.length === 0 && atualizacoesSaldoParcial.length === 0 && aberturasParaAbertos.length === 0) {
+    return { success: true, linhasAtualizadas: 0, message: 'Nada para migrar — todo cicloId já estava atribuído.' };
+  }
+
+  // 1) Respostas/Historico — agrupa por aba, lê a coluna CICLO_ID inteira uma vez, aplica em
+  // memória, escreve uma vez por aba (mesmo padrão em lote de migrarIdsHistoricos).
+  const porAba = {};
+  atualizacoesLinhas.forEach(u => {
+    const nome = u.aba.getName();
+    if (!porAba[nome]) porAba[nome] = { aba: u.aba, updates: [] };
+    porAba[nome].updates.push(u);
+  });
+  let linhasAtualizadas = 0;
+  Object.keys(porAba).forEach(nome => {
+    const { aba, updates } = porAba[nome];
+    const lastRow = aba.getLastRow();
+    if (lastRow < 2) return;
+    const numDataRows = lastRow - 1;
+    const colRange = aba.getRange(2, COL_RE.CICLO_ID + 1, numDataRows, 1); // +1: 0-indexed -> 1-indexed
+    const colValues = colRange.getValues();
+    updates.forEach(u => {
+      const idx = u.sheetRow - 2;
+      if (idx < 0 || idx >= colValues.length) return;
+      if (String(colValues[idx][0] || '').trim()) return; // idempotência: já tem, não sobrescreve
+      colValues[idx][0] = u.cicloId;
+      linhasAtualizadas++;
+    });
+    colRange.setValues(colValues);
+  });
+
+  // 2) Saldo_Parcial — CicloId retroativo pras chaves com saldo pendente.
+  let saldoParcialAtualizados = 0;
+  if (atualizacoesSaldoParcial.length > 0) {
+    const abaSaldo = garantirAbaSaldo(ss);
+    const dadosSaldo = abaSaldo.getDataRange().getValues();
+    for (let i = 1; i < dadosSaldo.length; i++) {
+      if (String(dadosSaldo[i][9] || '').trim()) continue; // já tem CicloId, não sobrescreve
+      const match = atualizacoesSaldoParcial.find(u =>
+        mesmoOperador(dadosSaldo[i][0], u.nrSerie) &&
+        String(dadosSaldo[i][1] || '').trim() === u.codItem &&
+        mesmoOperador(dadosSaldo[i][2], u.operacao)
+      );
+      if (match) {
+        abaSaldo.getRange(i + 1, 10).setValue(match.cicloId);
+        saldoParcialAtualizados++;
+      }
+    }
+  }
+
+  // 3) Abertos — itens correntemente abertos ganham o cicloId (flat ou dentro do JSON de lote).
+  // Agrupa por abertoId primeiro: um lote pode ter várias séries (chaves diferentes) todas
+  // apontando pro mesmo abertoId/linha de Abertos — resolve tudo de uma vez por linha, nunca
+  // reler o JSON já modificado em memória por engano.
+  let abertosAtualizados = 0;
+  if (aberturasParaAbertos.length > 0) {
+    const porAbertoId = {};
+    aberturasParaAbertos.forEach(a => {
+      if (!porAbertoId[a.abertoId]) porAbertoId[a.abertoId] = [];
+      const nrSerie = a.chave.split('::')[0];
+      porAbertoId[a.abertoId].push({ nrSerie, cicloId: a.cicloId });
+    });
+
+    const abaAb = garantirAbaAbertos(ss);
+    const dadosAb = abaAb.getDataRange().getValues();
+    for (let i = 1; i < dadosAb.length; i++) {
+      const abertoIdLinha = String(dadosAb[i][COL_AB.ABERTO_ID] || '').trim();
+      const membros = porAbertoId[abertoIdLinha];
+      if (!membros) continue;
+
+      const loteRaw = String(dadosAb[i][COL_AB.LOTE_SERIES] || '').trim();
+      if (loteRaw) {
+        let seriesArr = [];
+        try { seriesArr = JSON.parse(loteRaw); } catch (e) {}
+        let mudou = false;
+        membros.forEach(m => {
+          const idx = seriesArr.findIndex(s => String(s.nrSerie).trim() === m.nrSerie);
+          if (idx !== -1 && !seriesArr[idx].cicloId) { seriesArr[idx].cicloId = m.cicloId; mudou = true; }
+        });
+        if (mudou) {
+          abaAb.getRange(i + 1, COL_AB.LOTE_SERIES + 1).setValue(JSON.stringify(seriesArr));
+          abertosAtualizados++;
+        }
+      } else if (!String(dadosAb[i][COL_AB.CICLO_ID] || '').trim()) {
+        abaAb.getRange(i + 1, COL_AB.CICLO_ID + 1).setValue(membros[0].cicloId);
+        abertosAtualizados++;
+      }
+    }
+  }
+
+  SpreadsheetApp.flush();
+  return {
+    success: true,
+    linhasAtualizadas,
+    saldoParcialAtualizados,
+    abertosAtualizados,
+    message: linhasAtualizadas + ' linha(s) em Respostas/Historico, ' + saldoParcialAtualizados +
+      ' em Saldo_Parcial, ' + abertosAtualizados + ' em Abertos.',
+  };
+}
+
 // Expande o Set de abertoIds elegíveis pra todos os índices de linha (em dadosRe) que devem
 // se mover junto — a própria ABERTURA/FECHAMENTO(s) do id, e qualquer linha aninhada (parada/
 // retrabalho) cujo ABERTO_ID_PAI aponte pra ele.
@@ -3427,6 +3684,7 @@ function verificarSaldoParcialAction(nrSerie, codItem, operacao) {
             qtdRestante: qtd,
             ultimaAtualizacao: String(dados[i][4]),
             abertoId: String(dados[i][5] || ''),
+            cicloId: String(dados[i][9] || ''),
           });
         }
       }
