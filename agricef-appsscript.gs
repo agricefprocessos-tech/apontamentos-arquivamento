@@ -415,6 +415,20 @@ function doGet(e) {
       return jsonResponse({ success: false, message: err.message });
     }
   }
+  if (action === 'previewBackfillIdsParadaRetrabalho' && _adminAutorizado(e.parameter.key)) {
+    try {
+      return jsonResponse(previewBackfillIdsParadaRetrabalho());
+    } catch(err) {
+      return jsonResponse({ success: false, message: err.message });
+    }
+  }
+  if (action === 'executarBackfillIdsParadaRetrabalho' && _adminAutorizado(e.parameter.key)) {
+    try {
+      return jsonResponse(executarBackfillIdsParadaRetrabalho());
+    } catch(err) {
+      return jsonResponse({ success: false, message: err.message });
+    }
+  }
 
   // Ações via payload GET (contorna CORS)
   if (e.parameter.payload) {
@@ -7796,6 +7810,94 @@ function migrarIdsHistoricos(updates) {
     erros: erros.length > 0 ? erros : undefined,
     message: atualizados + ' linha(s) atualizadas, ' + ignorados + ' já corretas.',
   };
+}
+
+// ================================================================
+// BACKFILL DE ABERTOID — INÍCIO/TÉRMINO DE PARADA E RETRABALHO ANTIGOS
+//
+// O Fix#ID-LINK que grava abertoId em INÍCIO/TÉRMINO DE PARADA e RETRABALHO só entrou em
+// vigor a partir de determinada data — registros anteriores a isso ficaram com a coluna P
+// vazia. Diferente do ABERTURA/FECHAMENTO (que já foi corrigido antes, ver migrarIdsHistoricos),
+// esses dois tipos nunca passaram por um backfill equivalente.
+//
+// Pareia por OPERADOR, em ordem cronológica, alternando início/término — não usa série/item
+// porque paradas/retrabalhos antigos frequentemente não têm esses campos preenchidos. Cada
+// família (parada, retrabalho) é pareada separadamente, nunca cruza uma com a outra. Eventos
+// que sobram sem par (início sem término, ou vice-versa) são relatados, não recebem ID —
+// mais seguro deixar sem ID do que arriscar um pareamento errado.
+// ================================================================
+function _calcularBackfillIdsParadaRetrabalho(dadosRe) {
+  const FAMILIAS = [
+    { inicio: 'INÍCIO DE PARADA', termino: 'TÉRMINO DE PARADA' },
+    { inicio: 'INÍCIO DE RETRABALHO', termino: 'TÉRMINO DE RETRABALHO' },
+  ];
+
+  const atualizacoes = []; // {sheetRow, abertoId}
+  const semPar = [];       // eventos sem par encontrado — relatados, não escritos
+
+  FAMILIAS.forEach(fam => {
+    const porOperador = {};
+    for (let i = 1; i < dadosRe.length; i++) {
+      const row = dadosRe[i];
+      const tipo = String(row[COL_RE.TIPO] || '').trim();
+      if (tipo !== fam.inicio && tipo !== fam.termino) continue;
+      if (String(row[COL_RE.ABERTO_ID] || '').trim()) continue; // já tem ID, não mexe
+      const op = String(row[COL_RE.OPERADOR] || '').trim();
+      if (!porOperador[op]) porOperador[op] = [];
+      porOperador[op].push({ sheetRow: i + 1, tipo, ms: _carimboArquivamentoMs(row[COL_RE.CARIMBO]) });
+    }
+
+    Object.keys(porOperador).forEach(op => {
+      const eventos = porOperador[op].sort((a, b) => (a.ms || 0) - (b.ms || 0));
+      let abertoPendente = null;
+      eventos.forEach(ev => {
+        if (ev.tipo === fam.inicio) {
+          if (abertoPendente) semPar.push(abertoPendente); // 2 inícios seguidos sem término — anomalia
+          abertoPendente = ev;
+        } else {
+          if (abertoPendente) {
+            const id = gerarIdApontamento();
+            atualizacoes.push({ sheetRow: abertoPendente.sheetRow, abertoId: id });
+            atualizacoes.push({ sheetRow: ev.sheetRow, abertoId: id });
+            abertoPendente = null;
+          } else {
+            semPar.push(ev); // término sem início correspondente
+          }
+        }
+      });
+      if (abertoPendente) semPar.push(abertoPendente); // sobrou início nunca fechado
+    });
+  });
+
+  return { atualizacoes, semPar };
+}
+
+function previewBackfillIdsParadaRetrabalho() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const abaRe = ss.getSheetByName(ABA_RESPOSTAS);
+  if (!abaRe) return { success: false, message: 'Aba Respostas não encontrada.' };
+  const dadosRe = abaRe.getDataRange().getValues();
+  const { atualizacoes, semPar } = _calcularBackfillIdsParadaRetrabalho(dadosRe);
+  return {
+    success: true,
+    paresEncontrados: atualizacoes.length / 2,
+    semParEncontrados: semPar.length,
+    amostraPares: atualizacoes.slice(0, 20),
+    amostraSemPar: semPar.slice(0, 20).map(e => ({ sheetRow: e.sheetRow, tipo: e.tipo })),
+  };
+}
+
+function executarBackfillIdsParadaRetrabalho() {
+  const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const abaRe = ss.getSheetByName(ABA_RESPOSTAS);
+  if (!abaRe) return { success: false, message: 'Aba Respostas não encontrada.' };
+  const dadosRe = abaRe.getDataRange().getValues();
+  const { atualizacoes, semPar } = _calcularBackfillIdsParadaRetrabalho(dadosRe);
+  if (atualizacoes.length === 0) {
+    return { success: true, atualizados: 0, semParEncontrados: semPar.length, message: 'Nenhum par encontrado pra atualizar.' };
+  }
+  const resultado = migrarIdsHistoricos(atualizacoes);
+  return Object.assign({}, resultado, { semParEncontrados: semPar.length });
 }
 
 // ================================================================
