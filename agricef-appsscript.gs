@@ -66,6 +66,12 @@ const COL_RE = {
   ABERTO_ID_PAI:   17, // R  AbertoId do apontamento (ABERTURA/INÍCIO DE RETRABALHO) que esta
                        //    parada pausou, quando é uma PARADA ANINHADA. Vazio em qualquer
                        //    outro tipo de linha (inclusive parada standalone, sem aninhamento).
+  CICLO_ID:        18, // S  cicloId — identidade persistente do ciclo de produção (série+item+
+                       //    operação), reaproveitada entre reaberturas de baixa parcial. Nunca
+                       //    igual a ABERTO_ID (que segue identificando UMA sessão abre-fecha, ou
+                       //    um evento de abertura de lote). Só relevante em ABERTURA/FECHAMENTO —
+                       //    vazio em parada/retrabalho (não tocam Saldo_Parcial). Sempre derivado
+                       //    no servidor, nunca lido do payload do cliente.
 };
 
 const COL_AB = {
@@ -84,6 +90,8 @@ const COL_AB = {
   ABERTO_ID:       12, // abertoId (AP-XXXXXXXXXX)
   IS_LOTE:         13, // 'Sim'/'Não' — identifica explicitamente apontamento em lote
   ALERTA_ENVIADO_EM: 14, // carimbo de quando o alerta de "aberto há muito tempo" foi enviado (vazio = nunca)
+  CICLO_ID:        15, // cicloId (série única) — para lote, o cicloId de cada série vive dentro
+                       // do próprio JSON de LOTE_SERIES (campo cicloId por item), não aqui.
 };
 
 const TIPOS_APONTAMENTO = {
@@ -2280,7 +2288,7 @@ function garantirAbaAbertos(ss) {
   let aba = ss.getSheetByName(ABA_ABERTOS);
   if (!aba) {
     aba = ss.insertSheet(ABA_ABERTOS);
-    const cab = ['Operador','Implemento','Tipo','Operação','Carimbo','CodItem','QtdPlanejada','NrSerie','ImplementoNome','Cliente','OperadorNome','LoteSeries','AbertoId','IsLote','AlertaEnviadoEm'];
+    const cab = ['Operador','Implemento','Tipo','Operação','Carimbo','CodItem','QtdPlanejada','NrSerie','ImplementoNome','Cliente','OperadorNome','LoteSeries','AbertoId','IsLote','AlertaEnviadoEm','CicloId'];
     aba.appendRow(cab);
     aba.setFrozenRows(1);
     aba.getRange(1,1,1,cab.length).setFontWeight('bold').setBackground('#1a1a2e').setFontColor('#fff');
@@ -2289,7 +2297,7 @@ function garantirAbaAbertos(ss) {
     aba.getRange('E:E').setNumberFormat('@'); // carimbo como texto
   } else {
     // Migrações leves: planilhas existentes ganham colunas novas sem perder dados.
-    // Não usa "else if" — uma planilha bem antiga (<14 colunas) precisa ganhar as duas.
+    // Não usa "else if" — uma planilha bem antiga (<14 colunas) precisa ganhar todas as seguintes.
     if (aba.getLastColumn() < 14) {
       aba.getRange(1, 14).setValue('IsLote');
       aba.getRange(1, 14).setFontWeight('bold').setBackground('#1a1a2e').setFontColor('#fff');
@@ -2297,6 +2305,10 @@ function garantirAbaAbertos(ss) {
     if (aba.getLastColumn() < 15) {
       aba.getRange(1, 15).setValue('AlertaEnviadoEm');
       aba.getRange(1, 15).setFontWeight('bold').setBackground('#1a1a2e').setFontColor('#fff');
+    }
+    if (aba.getLastColumn() < 16) {
+      aba.getRange(1, 16).setValue('CicloId');
+      aba.getRange(1, 16).setFontWeight('bold').setBackground('#1a1a2e').setFontColor('#fff');
     }
   }
   return aba;
@@ -2347,6 +2359,13 @@ function jsonResponse(obj) {
 // Gera ID único no formato AP-XXXXXXXXXX
 function gerarIdApontamento() {
   return 'AP-' + Utilities.getUuid().replace(/-/g,'').substring(0, 10).toUpperCase();
+}
+
+// cicloId — identidade persistente do ciclo de produção (nrSerie+codItem+operacao), reaproveitada
+// entre reaberturas de baixa parcial. Prefixo diferente de gerarIdApontamento() de propósito —
+// nunca deve ser confundido com abertoId se colado no campo errado.
+function gerarCicloId() {
+  return 'CI-' + Utilities.getUuid().replace(/-/g,'').substring(0, 10).toUpperCase();
 }
 
 // Normaliza código de operador: Sheets converte '000130' → número 130.
@@ -2749,7 +2768,7 @@ function garantirAbaSaldo(ss) {
   let aba = ss.getSheetByName(ABA_SALDO);
   if (!aba) {
     aba = ss.insertSheet(ABA_SALDO);
-    const cab = ['NrSerie','CodItem','Operacao','QtdRestante','UltimaAtualizacao','AbertoId','OperadorCod','QtdPlanejadaTotal','IsLote'];
+    const cab = ['NrSerie','CodItem','Operacao','QtdRestante','UltimaAtualizacao','AbertoId','OperadorCod','QtdPlanejadaTotal','IsLote','CicloId'];
     aba.appendRow(cab);
     aba.setFrozenRows(1);
     aba.getRange(1,1,1,cab.length).setFontWeight('bold').setBackground('#4a2060').setFontColor('#fff');
@@ -2777,6 +2796,11 @@ function garantirAbaSaldo(ss) {
     aba.getRange(1, 9).setValue('IsLote');
     aba.getRange(1, 7, 1, 3).setFontWeight('bold').setBackground('#4a2060').setFontColor('#fff');
     aba.getRange('G:G').setNumberFormat('@');
+  } else if (aba.getLastColumn() < 10) {
+    // Migração leve: adiciona CicloId (identidade persistente do ciclo, separada de AbertoId)
+    aba.getRange(1, 10).setValue('CicloId');
+    aba.getRange(1, 10).setFontWeight('bold').setBackground('#4a2060').setFontColor('#fff');
+    aba.getRange('J:J').setNumberFormat('@');
   }
   return aba;
 }
